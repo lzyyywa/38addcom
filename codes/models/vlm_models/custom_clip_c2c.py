@@ -11,7 +11,6 @@ from utils.lorentz import expmap0
 
 _tokenizer = _Tokenizer()
 
-
 class MLP(nn.Module):
     def __init__(self, inp_dim, out_dim, num_layers=1, relu=True, bias=True, dropout=False, norm=False, layers=[]):
         super(MLP, self).__init__()
@@ -36,7 +35,6 @@ class MLP(nn.Module):
 
     def forward(self, x):
         return self.mod(x)
-
 
 class MLP_ST(nn.Module):
     def __init__(self, inp_dim, out_dim, num_layers=1, relu=True, bias=True, dropout=False, norm=False, layers=[]):
@@ -70,7 +68,6 @@ class MLP_ST(nn.Module):
                 x = o(x)
         return x
 
-
 class TextEncoder(nn.Module):
     def __init__(self, cfg, clip_model):
         super().__init__()
@@ -90,7 +87,6 @@ class TextEncoder(nn.Module):
         x = x[torch.arange(x.shape[0]), tokenized_prompts.argmax(dim=-1)] @ self.text_projection
         return x
 
-
 class VideoEncoder(nn.Module):
     def __init__(self, cfg, clip_model):
         super().__init__()
@@ -106,11 +102,10 @@ class VideoEncoder(nn.Module):
         out = rearrange(out, '(b t) d -> b d t', t=self.num_frames)
         return out
 
-
 class CustomCLIP(nn.Module):
     def __init__(self, cfg, train_dataset, clip_model):
         super().__init__()
-        # Text Prompt Learners
+        # Text Prompt Learners (Fine-grained)
         self.verb_prompt_learner = get_text_learner(cfg, train_dataset, clip_model, 'verb')
         self.verb_tokenized_prompts = self.verb_prompt_learner.token_ids
         self.obj_prompt_learner = get_text_learner(cfg, train_dataset, clip_model, 'object')
@@ -120,6 +115,20 @@ class CustomCLIP(nn.Module):
         self.text_encoder = TextEncoder(cfg, clip_model)
         self.video_encoder = VideoEncoder(cfg, clip_model)
         self.logit_scale = clip_model.logit_scale
+        self.token_embedding = clip_model.token_embedding  # 提取原始 embedding 层供粗粒度使用
+
+        # ------------ 新增：粗粒度文本预处理与 Token化 ------------
+        self.coarse_attrs = train_dataset.coarse_attrs
+        self.coarse_objs = train_dataset.coarse_objs
+        
+        # 构造标准的 CLIP prompt
+        coarse_verb_prompts = [f"a video of a person {c}" for c in self.coarse_attrs]
+        coarse_obj_prompts = [f"a video of a {c}" for c in self.coarse_objs]
+        
+        # 将 Token 注册为 buffer，避免设备不对齐
+        self.register_buffer('coarse_verb_tokens', clip.tokenize(coarse_verb_prompts))
+        self.register_buffer('coarse_obj_tokens', clip.tokenize(coarse_obj_prompts))
+        # ---------------------------------------------------------
 
         # Independent Learning Modules
         try:
@@ -137,16 +146,16 @@ class CustomCLIP(nn.Module):
         self.c2c_text_o = nn.Linear(cfg.feat_dim, cfg.emb_dim, bias=True)
 
         # ------------ 新增：双曲空间映射参数 ------------
-        # 曲率 c：可学习参数，初始化为 1.0
         self.c = nn.Parameter(torch.tensor([1.0]))
-        
-        # 缩放因子：分别控制视觉和文本特征投影前的模长，初始化为 0.1 防止 NaN
         self.visual_scale = nn.Parameter(torch.tensor([0.1]))
         self.text_scale = nn.Parameter(torch.tensor([0.1]))
         # ------------------------------------------------
 
-    def forward(self, video, pairs=None):
-        # 1. Text Features
+    # 修改前向传播签名，强制接收批次对应的文本标签索引
+    def forward(self, video, batch_verb=None, batch_obj=None, batch_coarse_verb=None, batch_coarse_obj=None, pairs=None):
+        device = video.device
+        
+        # 1. Fine-grained Text Features
         verb_prompts = self.verb_prompt_learner()
         verb_text_features = self.text_encoder(verb_prompts, self.verb_tokenized_prompts)
         verb_text_features = self.c2c_text_v(verb_text_features)
@@ -155,65 +164,93 @@ class CustomCLIP(nn.Module):
         obj_text_features = self.text_encoder(obj_prompts, self.obj_tokenized_prompts)
         obj_text_features = self.c2c_text_o(obj_text_features)
 
-        # 2. Video Features
-        video_features = self.video_encoder(video)
+        # 2. Coarse-grained Text Features (新增数据流)
+        # 用原生的 Token Embedding 获取输入，然后过定制的 text_encoder
+        with torch.no_grad():
+            c_v_emb = self.token_embedding(self.coarse_verb_tokens).type(self.text_encoder.dtype)
+            c_o_emb = self.token_embedding(self.coarse_obj_tokens).type(self.text_encoder.dtype)
+            
+        coarse_verb_features = self.text_encoder(c_v_emb, self.coarse_verb_tokens)
+        coarse_obj_features = self.text_encoder(c_o_emb, self.coarse_obj_tokens)
+        
+        # 保持空间一致性，过同一个线性映射层
+        coarse_verb_features = self.c2c_text_v(coarse_verb_features)
+        coarse_obj_features = self.c2c_text_o(coarse_obj_features)
 
-        # 3. Independent Learning
+        # 3. Video Features
+        video_features = self.video_encoder(video)
         o_feat = self.c2c_OE1(video_features.mean(dim=-1))
         v_feat_t = self.c2c_VE1(video_features)
         v_feat = v_feat_t.mean(dim=-1)
 
-        # ------------ 新增：欧式到双曲 (Lorentz) 的严格映射 ------------
-        # 确保曲率严格为正
+        # ------------ 严格的欧式到双曲 (Lorentz) 映射 ------------
         c_pos = F.softplus(self.c)
 
-        # L2 归一化并乘以可学习的缩放因子
+        # L2 归一化并缩放
         o_feat_norm = F.normalize(o_feat, p=2, dim=-1) * self.visual_scale
         v_feat_norm = F.normalize(v_feat, p=2, dim=-1) * self.visual_scale
+        
         verb_text_norm = F.normalize(verb_text_features, p=2, dim=-1) * self.text_scale
         obj_text_norm = F.normalize(obj_text_features, p=2, dim=-1) * self.text_scale
+        
+        coarse_verb_norm = F.normalize(coarse_verb_features, p=2, dim=-1) * self.text_scale
+        coarse_obj_norm = F.normalize(coarse_obj_features, p=2, dim=-1) * self.text_scale
 
-        # 升维：在第 0 维拼接时间维 0，使其符合 Lorentz 模型的 u = [0, x] 定义
-        u_o = torch.cat([torch.zeros(o_feat_norm.shape[0], 1, device=o_feat.device), o_feat_norm], dim=-1)
-        u_v = torch.cat([torch.zeros(v_feat_norm.shape[0], 1, device=v_feat.device), v_feat_norm], dim=-1)
-        u_t_v = torch.cat([torch.zeros(verb_text_norm.shape[0], 1, device=verb_text_features.device), verb_text_norm], dim=-1)
-        u_t_o = torch.cat([torch.zeros(obj_text_norm.shape[0], 1, device=obj_text_features.device), obj_text_norm], dim=-1)
+        # 补 0 升维
+        def to_lorentz_u(x):
+            return torch.cat([torch.zeros(x.shape[0], 1, device=device), x], dim=-1)
 
-        # 指数映射到双曲流形内部
-        o_hyp = expmap0(u_o, c=c_pos)
-        v_hyp = expmap0(u_v, c=c_pos)
-        t_v_hyp = expmap0(u_t_v, c=c_pos)
-        t_o_hyp = expmap0(u_t_o, c=c_pos)
-        # ---------------------------------------------------------------
+        # 执行 expmap0
+        o_hyp = expmap0(to_lorentz_u(o_feat_norm), c=c_pos)
+        v_hyp = expmap0(to_lorentz_u(v_feat_norm), c=c_pos)
+        
+        t_v_hyp_all = expmap0(to_lorentz_u(verb_text_norm), c=c_pos)
+        t_o_hyp_all = expmap0(to_lorentz_u(obj_text_norm), c=c_pos)
+        
+        coarse_v_hyp_all = expmap0(to_lorentz_u(coarse_verb_norm), c=c_pos)
+        coarse_o_hyp_all = expmap0(to_lorentz_u(coarse_obj_norm), c=c_pos)
 
-        # 4. Logits 计算改造：使用双曲距离替代欧式点积
-        # 定义 Lorentz 内积
+        # 4. 基础分类 Logits：洛伦兹内积与双曲距离
         def lorentz_inner(x, y):
             # x: [B, D+1], y: [N, D+1] -> return: [B, N]
             return -torch.matmul(x[:, 0:1], y[:, 0:1].t()) + torch.matmul(x[:, 1:], y[:, 1:].t())
 
-        verb_inner = lorentz_inner(v_hyp, t_v_hyp)
-        obj_inner = lorentz_inner(o_hyp, t_o_hyp)
+        verb_inner = lorentz_inner(v_hyp, t_v_hyp_all)
+        obj_inner = lorentz_inner(o_hyp, t_o_hyp_all)
 
-        # 计算双曲距离 d = arccosh(-inner / c) * sqrt(c)
         verb_dist = torch.acosh(torch.clamp(-verb_inner / c_pos, min=1.0 + 1e-5)) * torch.sqrt(c_pos)
         obj_dist = torch.acosh(torch.clamp(-obj_inner / c_pos, min=1.0 + 1e-5)) * torch.sqrt(c_pos)
 
-        # 将双曲距离转化为相似度分数 (使用 exp(-dist) 将距离映射到 0~1 区间)
         verb_logits = torch.exp(-verb_dist)
         obj_logits = torch.exp(-obj_dist)
-
-        # 5. Simple Composition (Product of probabilities)
         pred_com = torch.einsum('bi,bj->bij', verb_logits, obj_logits)
 
+        # ------------ 训练与测试的返回分流 ------------
         if self.training:
-            # 训练阶段保留原有的返回值结构，确保外部代码暂不崩溃
-            return verb_logits, obj_logits, pred_com
+            # 根据当前 batch 挑选对应的正样本对用于双曲蕴含锥计算
+            t_v_hyp_batch = t_v_hyp_all[batch_verb]
+            t_o_hyp_batch = t_o_hyp_all[batch_obj]
+            coarse_v_hyp_batch = coarse_v_hyp_all[batch_coarse_verb]
+            coarse_o_hyp_batch = coarse_o_hyp_all[batch_coarse_obj]
+
+            # 必须返回字典以打通 loss_calu 数据流
+            predict = {
+                'c_pos': c_pos,
+                'verb_logits': verb_logits,
+                'obj_logits': obj_logits,
+                'pred_com': pred_com,
+                'v_hyp': v_hyp,
+                'o_hyp': o_hyp,
+                't_v_hyp': t_v_hyp_batch,
+                't_o_hyp': t_o_hyp_batch,
+                'coarse_v_hyp': coarse_v_hyp_batch,
+                'coarse_o_hyp': coarse_o_hyp_batch
+            }
+            return predict
         else:
             verb_idx, obj_idx = pairs[:, 0], pairs[:, 1]
             com_logits = pred_com[:, verb_idx, obj_idx]
             return com_logits
-
 
 def load_clip_to_cpu(cfg):
     backbone_name = cfg.backbone
@@ -226,7 +263,6 @@ def load_clip_to_cpu(cfg):
         state_dict = torch.load(model_path, map_location="cpu")
     model = clip.build_model(state_dict or model.state_dict())
     return model
-
 
 def build_model(train_dataset, cfg):
     print(f"Loading CLIP (backbone: {cfg.backbone})")
@@ -258,7 +294,6 @@ def build_model(train_dataset, cfg):
             if 'temporal_embedding' in name or 'ln_post' in name or 'Adapter' in name or 'clip_proj' in name:
                 param.requires_grad = True
                 print(f'{name}: {param.requires_grad}')
-        # 确保新加入的双曲映射参数 (c, scale) 开启梯度
         elif 'c2c' in name or name in ['c', 'visual_scale', 'text_scale']:
             param.requires_grad = True
             print(f'{name}: {param.requires_grad}')
