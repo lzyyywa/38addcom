@@ -129,6 +129,22 @@ class CompositionVideoDataset(Dataset):
         self.obj2idx = {obj: idx for idx, obj in enumerate(self.objs)}
         self.attr2idx = {attr: idx for idx, attr in enumerate(self.attrs)}
         self.pair2idx = {pair: idx for idx, pair in enumerate(self.pairs)}
+        
+        # ------------ 新增：加载层次结构字典 ------------
+        hierarchy_dir = './data_split/hierarchy'  
+        with open(ospj(hierarchy_dir, 'obj_hierarchy.json'), 'r') as f:
+            self.obj_hierarchy = json.load(f)
+        with open(ospj(hierarchy_dir, 'verb_hierarchy.json'), 'r') as f:
+            self.verb_hierarchy = json.load(f)
+
+        # 提取并构建粗粒度标签的去重列表（用于后续文本编码器提取特征）
+        self.coarse_attrs = sorted(list(set(self.verb_hierarchy.values())))
+        self.coarse_objs = sorted(list(set(self.obj_hierarchy.values())))
+
+        # 构建粗粒度文本到索引的映射字典
+        self.coarse_attr2idx = {attr: idx for idx, attr in enumerate(self.coarse_attrs)}
+        self.coarse_obj2idx = {obj: idx for idx, obj in enumerate(self.coarse_objs)}
+        # ----------------------------------------------
 
         print('# train pairs: %d | # val pairs: %d | # test pairs: %d' % (len(
             self.train_pairs), len(self.val_pairs), len(self.test_pairs)))
@@ -470,9 +486,16 @@ class CompositionVideoDataset(Dataset):
         id, attr, obj = self.data[index]
         vid = self._load_video(id)
         vid = self.transform(vid)
+
+        # ------------ 新增：获取粗粒度文本（带有兜底机制） ------------
+        coarse_attr = self.verb_hierarchy[attr]
+        coarse_obj = self.obj_hierarchy[obj]
+        # ---------------------------------------------------------
+
         if self.phase == 'train':
             data = [
-                vid, self.attr2idx[attr], self.obj2idx[obj], self.train_pair_to_idx[(attr, obj)]
+                vid, self.attr2idx[attr], self.obj2idx[obj], self.train_pair_to_idx[(attr, obj)],
+                self.coarse_attr2idx[coarse_attr], self.coarse_obj2idx[coarse_obj]
             ]
 
             if self.return_n_matrix:
@@ -530,7 +553,8 @@ class CompositionVideoDataset(Dataset):
 
         else:
             data = [
-                vid, self.attr2idx[attr], self.obj2idx[obj], self.pair2idx[(attr, obj)]
+                vid, self.attr2idx[attr], self.obj2idx[obj], self.pair2idx[(attr, obj)],
+                self.coarse_attr2idx[coarse_attr], self.coarse_obj2idx[coarse_obj]
             ]
 
         return data
