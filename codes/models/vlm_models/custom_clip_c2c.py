@@ -139,7 +139,6 @@ class CustomCLIP(nn.Module):
         self.visual_scale = nn.Parameter(torch.tensor([0.1]))
         self.text_scale = nn.Parameter(torch.tensor([0.1]))
         
-        # 遵循 H2EM 的温度系数 0.07
         self.cls_temp = nn.Parameter(torch.tensor([0.07]))
 
     def forward(self, video, batch_verb=None, batch_obj=None, batch_coarse_verb=None, batch_coarse_obj=None, pairs=None):
@@ -168,10 +167,9 @@ class CustomCLIP(nn.Module):
 
         c_pos = F.softplus(self.c)
 
-        # 【核心修正】：强制退出 FP16，用纯粹无魔改的公式跑 FP32 双曲映射
+        
         with torch.cuda.amp.autocast(enabled=False):
             c_fp32 = c_pos.float()
-            # 还原最干净的原味缩放
             o_feat_fp32 = o_feat.float() * self.visual_scale.float()
             v_feat_fp32 = v_feat.float() * self.visual_scale.float()
             verb_text_fp32 = verb_text_features.float() * self.text_scale.float()
@@ -212,7 +210,6 @@ class CustomCLIP(nn.Module):
             }
             return predict
         else:
-            # 推理阶段依据公式转回概率矩阵，适配你 test.py 里 +0.001 的校准基线逻辑
             verb_prob = torch.softmax(verb_logits, dim=-1)
             obj_prob = torch.softmax(obj_logits, dim=-1)
             pred_com = verb_prob.unsqueeze(2) * obj_prob.unsqueeze(1)
