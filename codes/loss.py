@@ -6,15 +6,11 @@ import math
 from utils.lorentz import pairwise_dist, half_aperture, oxy_angle
 
 class HierarchicalEntailmentLoss(nn.Module):
-    """
-    严格对齐 H^2EM 公式 (11)
-    """
     def __init__(self, K=0.1):
         super().__init__()
         self.K = K
 
     def forward(self, child, parent, c):
-        # 强制进入 FP32，防止运算期间溢出引发 NaN
         with torch.cuda.amp.autocast(enabled=False):
             theta = oxy_angle(parent.float(), child.float(), curv=c.float()).unsqueeze(1)               
             alpha_parent = half_aperture(parent.float(), curv=c.float(), min_radius=self.K).unsqueeze(1) 
@@ -22,9 +18,6 @@ class HierarchicalEntailmentLoss(nn.Module):
         return loss_cone.mean()
 
 class DiscriminativeAlignmentLoss(nn.Module):
-    """
-    严格对齐 H^2EM 公式 (14) 及其 w=3.0 的难负样本加权机制
-    """
     def __init__(self, temperature=0.07, hard_weight=3.0):
         super().__init__()
         self.temperature = temperature
@@ -39,7 +32,7 @@ class DiscriminativeAlignmentLoss(nn.Module):
             B = v_hyp.size(0)
             mask_verb = (batch_verb.unsqueeze(1) == batch_verb.unsqueeze(0))
             mask_obj = (batch_obj.unsqueeze(1) == batch_obj.unsqueeze(0))
-            # H^2EM 难负样本：同动词或同物品，且排除自身
+    
             mask_hard = (mask_verb | mask_obj) & ~torch.eye(B, dtype=torch.bool, device=v_hyp.device)
             
             if self.hard_weight > 1.0:
