@@ -72,6 +72,7 @@ train:
 #  cutmix_prob: 0.7
 #  beta: 1.0
   w_cls: 0.1   #动词/物品分类损失权重
+  w_com: 1.0
   w_dal: 1.0   #判别对齐损失权重
   w_hem: 0.5   #层次蕴含  
 
