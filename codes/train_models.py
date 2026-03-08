@@ -10,7 +10,7 @@ import torch.multiprocessing
 import numpy as np
 import json
 import math
-from torch.nn import CrossEntropyLoss  
+from torch.nn import CrossEntropyLoss
 from utils.ade_utils import emd_inference_opencv_test
 from collections import Counter
 from utils.hsic import hsic_normalized_cca
@@ -113,7 +113,7 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
 
     train_pairs = torch.tensor([(attr2idx[attr], obj2idx[obj])
                                 for attr, obj in train_dataset.train_pairs]).cuda()
-    
+
     # ================= 【新增这一行，其他地方完全没动】 =================
     config.train_pairs = train_pairs
     # ====================================================================
@@ -174,7 +174,7 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
             epoch_com_losses.append(loss_dict['loss_com']) # 【新增】：加入 L_com 列表
 
             current_c = predict['c_pos'].item()
-            if hasattr(model, 'module'): 
+            if hasattr(model, 'module'):
                 current_temp = F.softplus(model.module.cls_temp).item() + 0.05
             else:
                 current_temp = F.softplus(model.cls_temp).item() + 0.05
@@ -186,18 +186,18 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
                 "com": f"{np.mean(epoch_com_losses[-50:]):.2f}", # 【新增】：进度条显示 L_com
                 "dal": f"{np.mean(epoch_dal_losses[-50:]):.2f}",
                 "hem": f"{np.mean(epoch_hem_losses[-50:]):.2f}",
-                "c": f"{current_c:.3f}", 
+                "c": f"{current_c:.3f}",
                 "tau": f"{current_temp:.3f}"
             })
             progress_bar.update()
 
         lr_scheduler.step()
         progress_bar.close()
-        
+
         # 打印并写入到 log.txt
         progress_bar.write(f"epoch {i + 1} train loss {np.mean(epoch_train_losses):.4f}")
         train_losses.append(np.mean(epoch_train_losses))
-        
+
         log_training.write('\n')
         log_training.write(f"epoch {i + 1} train loss {np.mean(epoch_train_losses):.4f}\n")
         log_training.write(f"epoch {i + 1} cls_verb loss {np.mean(epoch_cls_v_losses):.4f}\n")
@@ -213,7 +213,7 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
                 'scheduler': lr_scheduler.state_dict(),
                 'scaler': scaler.state_dict(),
             }, config.save_path, i)
-            
+
         key_set = ["attr_acc", "obj_acc", "ub_seen", "ub_unseen", "ub_all", "best_seen", "best_unseen", "best_hm", "AUC"]
         if i % config.eval_every_n == 0 or i + 1 == config.epochs or i >= config.val_epochs_ts:
             print("Evaluating val dataset:")
@@ -267,7 +267,7 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
                     log_training.write("Loss average on test dataset: {}\n".format(loss_avg))
         log_training.write('\n')
         log_training.flush()
-        
+
         if i + 1 == config.epochs:
             print("Evaluating test dataset on Closed World")
             model.load_state_dict(torch.load(os.path.join(
