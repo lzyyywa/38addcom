@@ -56,6 +56,9 @@ def loss_calu(predict, target, config):
     verb_logits = predict['verb_logits']
     obj_logits = predict['obj_logits']
     
+    # 【新增】：提取 C2C 双流推断出的完整组合概率矩阵 [Batch, N_verb, N_obj]
+    pred_com_prob = predict['pred_com_prob'] 
+    
     v_hyp = predict['v_hyp']                  
     o_hyp = predict['o_hyp']
     v_c_hyp = predict['v_c_hyp']              
@@ -69,28 +72,27 @@ def loss_calu(predict, target, config):
     dal_loss_fn = DiscriminativeAlignmentLoss(temperature=0.07, hard_weight=3.0)
     hem_loss_fn = HierarchicalEntailmentLoss(K=0.1)
 
-    # ================= 严格对齐论文 Eq 14 和 Eq 15 =================
-    
-    # 1. 基元分支 (Primitive)：只保留普通的交叉熵分类损失 (Eq 15)
+    # ================= 1. C2C 核心推断损失 (新增) =================
+    B = pred_com_prob.size(0)
+    batch_idx = torch.arange(B, device=pred_com_prob.device)
+    # 取出当前 batch 中，真实的 verb 和 obj 对应的预测概率
+    target_probs = pred_com_prob[batch_idx, batch_verb, batch_obj]
+    # 使用负对数似然 (NLL) 逼近真实的组合
+    loss_com = -torch.log(target_probs + 1e-8).mean()
+
+    # ================= 2. 基元分支交叉熵 (Primitive) =================
     loss_cls_verb = ce_loss_fn(verb_logits, batch_verb)
     loss_cls_obj = ce_loss_fn(obj_logits, batch_obj)
     
-    # 2. 组合分支 (Composition)：计算判别对齐损失 DAL (Eq 14)
+    # ================= 3. 工具人 DAL 损失 (Discriminative Alignment) =================
     mask_verb = (batch_verb.unsqueeze(1) == batch_verb.unsqueeze(0))
     mask_obj = (batch_obj.unsqueeze(1) == batch_obj.unsqueeze(0))
-    
-    # 正样本：动词和物品必须同时相同
     mask_pos_comp = mask_verb & mask_obj
-    
-    # 难负样本：动词相同但物品不同，或者物品相同但动词不同 (使用异或操作 ^)
     mask_hard_comp = mask_verb ^ mask_obj 
     
-    # 仅在组合特征 (v_c_hyp 和 t_c_hyp) 上应用 DAL！
     loss_dal = dal_loss_fn(v_c_hyp, t_c_hyp, c_pos, mask_pos=mask_pos_comp, mask_hard=mask_hard_comp)
     
-    # ==============================================================
-
-    # 3. 层次蕴含损失 (Eq 13)：同模态内部约束
+    # ================= 4. 工具人 HEM 损失 (Hierarchical Entailment) =================
     loss_hem_vc2vs = hem_loss_fn(child=v_c_hyp, parent=v_hyp, c=c_pos)
     loss_hem_vc2vo = hem_loss_fn(child=v_c_hyp, parent=o_hyp, c=c_pos)
     loss_hem_tc2ts = hem_loss_fn(child=t_c_hyp, parent=t_v_hyp, c=c_pos)
@@ -102,17 +104,21 @@ def loss_calu(predict, target, config):
                loss_hem_tc2ts + loss_hem_tc2to + \
                loss_hem_ts2tsp + loss_hem_to2top
 
+    # ================= 5. 总损失融合 =================
     w_cls = getattr(config, 'w_cls', 1.0)
+    w_com = getattr(config, 'w_com', 1.0) # [新增] 获取组合损失权重
     w_dal = getattr(config, 'w_dal', 1.0)
     w_hem = getattr(config, 'w_hem', 1.0)
 
     total_loss = w_cls * (loss_cls_verb + loss_cls_obj) + \
+                 w_com * loss_com + \
                  w_dal * loss_dal + \
                  w_hem * loss_hem
                  
     loss_dict = {
         'loss_cls_verb': loss_cls_verb.item(),
         'loss_cls_obj': loss_cls_obj.item(),
+        'loss_com': loss_com.item(),      # [新增] 记录到字典供外层打印
         'loss_dal': loss_dal.item(),
         'loss_hem': loss_hem.item()
     }
