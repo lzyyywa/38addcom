@@ -122,7 +122,7 @@ class CustomCLIP(nn.Module):
         self.register_buffer('coarse_verb_tokens', clip.tokenize(coarse_verb_prompts))
         self.register_buffer('coarse_obj_tokens', clip.tokenize(coarse_obj_prompts))
 
-        # 缓存组合 token
+        # 缓存组合
         comp_prompts = [f"a video of a person {v} {o}" for v, o in train_dataset.pairs]
         self.register_buffer('comp_tokens', clip.tokenize(comp_prompts))
 
@@ -132,18 +132,14 @@ class CustomCLIP(nn.Module):
             fc_emb = [cfg.fc_emb]
         layers = [int(a) for a in fc_emb]
 
-        # 独立特征提取网络
         self.c2c_OE1 = MLP(cfg.feat_dim, int(cfg.emb_dim), relu=cfg.relu, num_layers=cfg.nlayers, dropout=False, norm=True, layers=layers)
         self.c2c_VE1 = MLP_ST(cfg.feat_dim, int(cfg.emb_dim), relu=cfg.relu, num_layers=cfg.nlayers, dropout=False, norm=True, layers=layers)
 
-        # 提取全局组合视觉特征 v_c (作为正则化工具人)
         self.c2c_CE1 = MLP(cfg.feat_dim, int(cfg.emb_dim), relu=cfg.relu, num_layers=cfg.nlayers, dropout=False, norm=True, layers=layers)
 
-        # 【新增：C2C 论文专属条件特征网络】
         self.c2c_OE2 = MLP(cfg.feat_dim, int(cfg.emb_dim), relu=cfg.relu, num_layers=cfg.nlayers, dropout=False, norm=True, layers=layers)
         self.c2c_VE2 = MLP_ST(cfg.feat_dim, int(cfg.emb_dim), relu=cfg.relu, num_layers=cfg.nlayers, dropout=False, norm=True, layers=layers)
 
-        # 【新增：C2C 论文欧式拼接融合层】
         self.c2c_f_v_e_o_com = nn.Linear(2 * cfg.emb_dim, cfg.emb_dim, bias=True)
         self.c2c_f_o_e_v_com = nn.Linear(2 * cfg.emb_dim, cfg.emb_dim, bias=True)
 
@@ -157,7 +153,6 @@ class CustomCLIP(nn.Module):
 
         self.cls_temp = nn.Parameter(torch.tensor([0.07]))
 
-    # 【新增方法：纯欧式拼接，供双曲映射使用】
     def condition_module_hyperbolic(self, v_feat_c, o_feat_c, v_emb, o_emb, n_o, b, c, n_v):
         f_v_e_o = self.c2c_f_v_e_o_com(
             torch.cat([v_feat_c.unsqueeze(1).repeat(1, n_o, 1), o_emb.unsqueeze(0).repeat(b, 1, 1)], dim=-1).view(-1, c * 2))
@@ -190,15 +185,12 @@ class CustomCLIP(nn.Module):
 
         video_features = self.video_encoder(video)
 
-        # 独立特征
         o_feat = self.c2c_OE1(video_features.mean(dim=-1))
         v_feat_t = self.c2c_VE1(video_features)
         v_feat = v_feat_t.mean(dim=-1)
 
-        # 工具人组合特征 v_c
         v_c_feat = self.c2c_CE1(video_features.mean(dim=-1))
 
-        # 【新增：C2C 视觉条件特征】
         o_feat_c = self.c2c_OE2(video_features.mean(dim=-1))
         v_feat_c = self.c2c_VE2(video_features).mean(dim=-1)
 
@@ -207,7 +199,7 @@ class CustomCLIP(nn.Module):
         with torch.cuda.amp.autocast(enabled=False):
             c_fp32 = c_pos.float()
 
-            # 基础特征转 fp32
+            # 转 fp32
             o_feat_fp32 = o_feat.float()
             v_feat_fp32 = v_feat.float()
             v_c_feat_fp32 = v_c_feat.float()
@@ -215,18 +207,16 @@ class CustomCLIP(nn.Module):
             verb_text_fp32 = verb_text_features.float()
             obj_text_fp32 = obj_text_features.float()
 
-            # 【新增：调用欧式融合】
             b = video_features.shape[0]
             feat_dim_c = verb_text_fp32.shape[-1]
             n_v = verb_text_fp32.shape[0]
             n_o = obj_text_fp32.shape[0]
 
-            # 在欧式空间拼接获得联合特征（无归一化）
             cond_v_euc, cond_o_euc = self.condition_module_hyperbolic(
                 v_feat_c.float(), o_feat_c.float(), verb_text_fp32, obj_text_fp32, n_o, b, feat_dim_c, n_v
             )
 
-            # --- 全员乘以缩放系数 (对齐尺度) ---
+            # 缩放系数--
             o_feat_scaled = o_feat_fp32 * self.visual_scale.float()
             v_feat_scaled = v_feat_fp32 * self.visual_scale.float()
             v_c_feat_scaled = v_c_feat_fp32 * self.visual_scale.float()
@@ -240,31 +230,29 @@ class CustomCLIP(nn.Module):
             coarse_verb_scaled = coarse_verb_features.float() * self.text_scale.float()
             coarse_obj_scaled = coarse_obj_features.float() * self.text_scale.float()
 
-            # --- 映射到双曲空间 (升维打击) ---
+            #映射到双曲空间-
             o_hyp = exp_map0(o_feat_scaled, curv=c_fp32)
             v_hyp = exp_map0(v_feat_scaled, curv=c_fp32)
-            v_c_hyp = exp_map0(v_c_feat_scaled, curv=c_fp32) # 工具人 vc 的双曲点
+            v_c_hyp = exp_map0(v_c_feat_scaled, curv=c_fp32)
 
             t_v_hyp_all = exp_map0(verb_text_scaled, curv=c_fp32)
             t_o_hyp_all = exp_map0(obj_text_scaled, curv=c_fp32)
             coarse_v_hyp_all = exp_map0(coarse_verb_scaled, curv=c_fp32)
             coarse_o_hyp_all = exp_map0(coarse_obj_scaled, curv=c_fp32)
 
-            # 【新增：条件特征的双曲点】
+            
             cond_o_hyp = exp_map0(cond_o_scaled, curv=c_fp32) # [B, N_v, D]
             cond_v_hyp = exp_map0(cond_v_scaled, curv=c_fp32) # [B, N_o, D]
 
-            # --- 计算双曲测地距离 ---
+            #计算双曲测地距离 
             verb_dist = pairwise_dist(v_hyp, t_v_hyp_all, curv=c_fp32)
             obj_dist = pairwise_dist(o_hyp, t_o_hyp_all, curv=c_fp32)
 
-            # 【新增：条件特征计算距离，展平以适配 pairwise_dist】
             cond_o_dist = pairwise_dist(cond_o_hyp.view(-1, feat_dim_c), t_o_hyp_all, curv=c_fp32).view(b, n_v, n_o)
             cond_v_dist = pairwise_dist(cond_v_hyp.view(-1, feat_dim_c), t_v_hyp_all, curv=c_fp32).view(b, n_o, n_v)
 
             temp = F.softplus(self.cls_temp) + 0.05
 
-            # ================= 【修改点 1：改为提取 Logits 并相加】 =================
             verb_logits = -verb_dist / temp
             obj_logits = -obj_dist / temp
             cond_o_logits = -cond_o_dist / temp
@@ -275,12 +263,10 @@ class CustomCLIP(nn.Module):
             # 静态路径 Logits: log p(o) + log p(v|o)
             logits_sta = cond_v_logits.transpose(1, 2) + obj_logits.unsqueeze(1) # [B, N_v, N_o]
 
-            # 联合 Logits (等价于原生代码中未过 softmax 的 p_pair_v + p_pair_o)
             pred_com_logits = logits_dyn + logits_sta
-            # ====================================================================
 
         if self.training:
-            # 工具人 t_c 提取，专门用于 HEM Loss
+
             batch_comp_tokens = self.comp_tokens[pairs]
             with torch.no_grad():
                 batch_comp_emb = self.token_embedding(batch_comp_tokens).type(self.text_encoder.dtype)
@@ -298,21 +284,21 @@ class CustomCLIP(nn.Module):
 
             predict = {
                 'c_pos': c_pos,
-                'verb_logits': verb_logits,        # [修改] 直接用上面算好的 logits
-                'obj_logits': obj_logits,          # [修改] 直接用上面算好的 logits
-                'pred_com_logits': pred_com_logits, # [修改] 传出联合 Logits 给 Loss
+                'verb_logits': verb_logits,      
+                'obj_logits': obj_logits,       
+                'pred_com_logits': pred_com_logits,
                 'v_hyp': v_hyp,
                 'o_hyp': o_hyp,
-                'v_c_hyp': v_c_hyp,                 # 工具人
+                'v_c_hyp': v_c_hyp,               
                 't_v_hyp': t_v_hyp_batch,
                 't_o_hyp': t_o_hyp_batch,
-                't_c_hyp': t_c_hyp_batch,           # 工具人
+                't_c_hyp': t_c_hyp_batch,         
                 'coarse_v_hyp': coarse_v_hyp_batch,
                 'coarse_o_hyp': coarse_o_hyp_batch
             }
             return predict
         else:
-            # 测试阶段直接返回切片后的联合 Logits
+            
             verb_idx, obj_idx = pairs[:, 0], pairs[:, 1]
             com_logits = pred_com_logits[:, verb_idx, obj_idx]
             return com_logits
