@@ -114,9 +114,7 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
     train_pairs = torch.tensor([(attr2idx[attr], obj2idx[obj])
                                 for attr, obj in train_dataset.train_pairs]).cuda()
 
-    # ================= 【新增这一行，其他地方完全没动】 =================
     config.train_pairs = train_pairs
-    # ====================================================================
 
     train_losses = []
 
@@ -130,7 +128,7 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
         epoch_cls_o_losses = []
         epoch_dal_losses = []
         epoch_hem_losses = []
-        epoch_com_losses = [] # 【新增】：监控 C2C 组合推断损失 L_com
+        epoch_com_losses = [] 
 
         temp_lr = optimizer.param_groups[-1]['lr']
         print(f'Current_lr:{temp_lr}')
@@ -171,7 +169,7 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
             epoch_cls_o_losses.append(loss_dict['loss_cls_obj'])
             epoch_dal_losses.append(loss_dict['loss_dal'])
             epoch_hem_losses.append(loss_dict['loss_hem'])
-            epoch_com_losses.append(loss_dict['loss_com']) # 【新增】：加入 L_com 列表
+            epoch_com_losses.append(loss_dict['loss_com']) 
 
             current_c = predict['c_pos'].item()
             if hasattr(model, 'module'):
@@ -183,7 +181,7 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
                 "loss": f"{np.mean(epoch_train_losses[-50:]):.2f}",
                 "v_cls": f"{np.mean(epoch_cls_v_losses[-50:]):.2f}",
                 "o_cls": f"{np.mean(epoch_cls_o_losses[-50:]):.2f}",
-                "com": f"{np.mean(epoch_com_losses[-50:]):.2f}", # 【新增】：进度条显示 L_com
+                "com": f"{np.mean(epoch_com_losses[-50:]):.2f}", 
                 "dal": f"{np.mean(epoch_dal_losses[-50:]):.2f}",
                 "hem": f"{np.mean(epoch_hem_losses[-50:]):.2f}",
                 "c": f"{current_c:.3f}",
