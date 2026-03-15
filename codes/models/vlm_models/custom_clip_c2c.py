@@ -6,9 +6,19 @@ from models.vlm_models.text_learner import get_text_learner
 import torch.nn.functional as F
 from einops import rearrange
 
+# 引入双曲映射工具
 from utils.lorentz import exp_map0, log_map0, pairwise_dist
 
 _tokenizer = _Tokenizer()
+
+# =====================================================================
+# 【防爆核心】：最大模长裁剪 (Norm Clipping)
+# 作用：限制特征飞出安全区导致 NaN，但绝不改变短特征的长度(保留真实的双曲层级)
+# =====================================================================
+def clip_by_norm(x, max_norm=3.0):
+    norm = torch.norm(x, dim=-1, keepdim=True)
+    scale = torch.clamp(max_norm / (norm + 1e-6), max=1.0)
+    return x * scale
 
 class MLP(nn.Module):
     def __init__(self, inp_dim, out_dim, num_layers=1, relu=True, bias=True, dropout=False, norm=False, layers=[]):
@@ -148,9 +158,20 @@ class CustomCLIP(nn.Module):
         self.c = nn.Parameter(torch.tensor([1.0]), requires_grad=True)
         self.visual_scale = nn.Parameter(torch.tensor([1.0]))
         self.text_scale = nn.Parameter(torch.tensor([1.0]))
+        
+        self.d_coarse = nn.Parameter(torch.tensor([1.0]))
+        self.d_fine = nn.Parameter(torch.tensor([2.0]))
+        self.d_comp = nn.Parameter(torch.tensor([3.0]))
 
         self.cls_temp = nn.Parameter(torch.tensor([0.07]))
         self.use_hyperbolic = getattr(cfg, 'use_hyperbolic', True)
+
+    # =====================================================================
+    # 【严格对齐文献3】：Horosphere Projection (HP模块)
+    # 将双曲流形上的概念投影到平坦切空间，保留关系的同时获得组合性
+    # =====================================================================
+    def horosphere_projection(self, hyp_x, curv):
+        return log_map0(hyp_x, curv=curv)
 
     def condition_module_hyperbolic(self, v_feat_c, o_feat_c, v_emb, o_emb, n_o, b, c, n_v):
         f_v_e_o = self.c2c_f_v_e_o_com(
@@ -208,48 +229,62 @@ class CustomCLIP(nn.Module):
             n_v = verb_text_fp32.shape[0]
             n_o = obj_text_fp32.shape[0]
 
-            # ===================== 一键分支切换：双曲 vs 欧式 =====================
             if self.use_hyperbolic:
-                # ------------------------- 【最纯正双曲分支 (零归一化 + HP投影)】 -------------------------
-                # 仅仅限制 scale 的下限防止除零，不干涉特征原生的方向和模长
-                v_scale = torch.clamp(self.visual_scale.float(), min=0.1)
-                t_scale = torch.clamp(self.text_scale.float(), min=0.1)
+                # ==========================================
+                # 终极修复区：严格对齐 HP 组合 + 半径截断防爆
+                # ==========================================
+                v_scale = torch.clamp(self.visual_scale.float(), min=0.01)
+                t_scale = torch.clamp(self.text_scale.float(), min=0.01)
 
-                # 【核心修正】：彻底抛弃 F.normalize，原汁原味地保留欧式 MLP 输出的模长！
-                # 模长(Norm) = 语义深度。让 HEM Loss 去教模型拉长组合特征、缩短粗粒度特征。
-                o_feat_scaled = o_feat_fp32 * v_scale
-                v_feat_scaled = v_feat_fp32 * v_scale
-                v_c_feat_scaled = v_c_feat_fp32 * v_scale
+                MAX_R = 3.5
 
-                verb_text_scaled = verb_text_fp32 * t_scale
-                obj_text_scaled = obj_text_fp32 * t_scale
-                coarse_verb_scaled = coarse_verb_features.float() * t_scale
-                coarse_obj_scaled = coarse_obj_features.float() * t_scale
+                # 1. 截断特征，保证不 NaN，同时保持相对长度比例
+                o_feat_clipped = clip_by_norm(o_feat_fp32 * v_scale, MAX_R)
+                v_feat_clipped = clip_by_norm(v_feat_fp32 * v_scale, MAX_R)
+                v_c_feat_clipped = clip_by_norm(v_c_feat_fp32 * v_scale, MAX_R)
 
-                # 1. 映射基础概念进入双曲空间，建立树结构
-                o_hyp = exp_map0(o_feat_scaled, curv=c_fp32)
-                v_hyp = exp_map0(v_feat_scaled, curv=c_fp32)
-                v_c_hyp = exp_map0(v_c_feat_scaled, curv=c_fp32) 
+                # 条件特征截断
+                o_cond_clipped = clip_by_norm(o_feat_c.float() * v_scale, MAX_R)
+                v_cond_clipped = clip_by_norm(v_feat_c.float() * v_scale, MAX_R)
 
-                t_v_hyp_all = exp_map0(verb_text_scaled, curv=c_fp32)
-                t_o_hyp_all = exp_map0(obj_text_scaled, curv=c_fp32)
-                coarse_v_hyp_all = exp_map0(coarse_verb_scaled, curv=c_fp32)
-                coarse_o_hyp_all = exp_map0(coarse_obj_scaled, curv=c_fp32)
+                t_v_clipped = clip_by_norm(verb_text_fp32 * t_scale, MAX_R)
+                t_o_clipped = clip_by_norm(obj_text_fp32 * t_scale, MAX_R)
+                coarse_v_clipped = clip_by_norm(coarse_verb_features.float() * t_scale, MAX_R)
+                coarse_o_clipped = clip_by_norm(coarse_obj_features.float() * t_scale, MAX_R)
 
-                # 2. 在平坦切空间中完成特征融合 (HyperExpress HP核心思想)
-                # 使用的也是纯净的 scaled 特征，绝不归一化
-                cond_v_flat_in = v_feat_c.float() * v_scale
-                cond_o_flat_in = o_feat_c.float() * v_scale
+                # 2. 【建立双曲概念空间】：所有特征统一映射到双曲流形
+                o_hyp = exp_map0(o_feat_clipped, curv=c_fp32)
+                v_hyp = exp_map0(v_feat_clipped, curv=c_fp32)
+                v_c_hyp = exp_map0(v_c_feat_clipped, curv=c_fp32) 
 
+                t_v_hyp_all = exp_map0(t_v_clipped, curv=c_fp32)
+                t_o_hyp_all = exp_map0(t_o_clipped, curv=c_fp32)
+                coarse_v_hyp_all = exp_map0(coarse_v_clipped, curv=c_fp32)
+                coarse_o_hyp_all = exp_map0(coarse_o_clipped, curv=c_fp32)
+
+                # 条件特征也必须在双曲空间中取得合法"身份"
+                o_cond_hyp = exp_map0(o_cond_clipped, curv=c_fp32)
+                v_cond_hyp = exp_map0(v_cond_clipped, curv=c_fp32)
+
+                # 3. 【执行 HP 投影】：从双曲概念空间投影到平坦组合空间 (严格对齐第三篇文献)
+                v_cond_hp_flat = self.horosphere_projection(v_cond_hyp, curv=c_fp32)
+                o_cond_hp_flat = self.horosphere_projection(o_cond_hyp, curv=c_fp32)
+                t_v_hp_flat = self.horosphere_projection(t_v_hyp_all, curv=c_fp32)
+                t_o_hp_flat = self.horosphere_projection(t_o_hyp_all, curv=c_fp32)
+
+                # 4. 在平坦空间中进行原生 C2C 组合
                 cond_v_flat_out, cond_o_flat_out = self.condition_module_hyperbolic(
-                    cond_v_flat_in, cond_o_flat_in, verb_text_scaled, obj_text_scaled, n_o, b, feat_dim_c, n_v
+                    v_cond_hp_flat, o_cond_hp_flat, t_v_hp_flat, t_o_hp_flat, n_o, b, feat_dim_c, n_v
                 )
 
-                # 融合后直接升维进入双曲空间
-                cond_o_hyp = exp_map0(cond_o_flat_out, curv=c_fp32) # [B, N_v, D]
-                cond_v_hyp = exp_map0(cond_v_flat_out, curv=c_fp32) # [B, N_o, D]
+                # 5. 组合特征防爆截断，然后重新映射回双曲空间
+                cond_o_flat_out = clip_by_norm(cond_o_flat_out, MAX_R)
+                cond_v_flat_out = clip_by_norm(cond_v_flat_out, MAX_R)
 
-                # --- 测地距离计算 (与之前相同) ---
+                cond_o_hyp = exp_map0(cond_o_flat_out, curv=c_fp32) 
+                cond_v_hyp = exp_map0(cond_v_flat_out, curv=c_fp32) 
+
+                # --- 测地距离计算 (H2EM 对齐) ---
                 verb_dist = pairwise_dist(v_hyp, t_v_hyp_all, curv=c_fp32)
                 obj_dist = pairwise_dist(o_hyp, t_o_hyp_all, curv=c_fp32)
                 cond_o_dist = pairwise_dist(cond_o_hyp.view(-1, feat_dim_c), t_o_hyp_all, curv=c_fp32).view(b, n_v, n_o)
@@ -265,7 +300,7 @@ class CustomCLIP(nn.Module):
                 logits_dyn = cond_o_logits + verb_logits.unsqueeze(-1)  
                 logits_sta = cond_v_logits.transpose(1, 2) + obj_logits.unsqueeze(1) 
 
-                # C2C Vanilla 双流融合概率对齐
+                # C2C Vanilla 双流融合概率对齐 (对数空间求和)
                 pred_com_logits = torch.logsumexp(torch.stack([logits_dyn, logits_sta], dim=0), dim=0)
 
                 if self.training:
@@ -276,8 +311,7 @@ class CustomCLIP(nn.Module):
                     batch_comp_text_features = self.c2c_text_c(batch_comp_text_features)
 
                     with torch.cuda.amp.autocast(enabled=False):
-                        # 工具人 t_c 也保持纯净
-                        t_c_feat_fp32 = batch_comp_text_features.float() * t_scale
+                        t_c_feat_fp32 = clip_by_norm(batch_comp_text_features.float() * t_scale, MAX_R)
                         t_c_hyp_batch = exp_map0(t_c_feat_fp32, curv=c_fp32)
 
                     t_v_hyp_batch = t_v_hyp_all[batch_verb]
