@@ -6,14 +6,13 @@ from models.vlm_models.text_learner import get_text_learner
 import torch.nn.functional as F
 from einops import rearrange
 
-# 引入双曲映射工具
+# 严格对齐工具库
 from utils.lorentz import exp_map0, log_map0, pairwise_dist
 
 _tokenizer = _Tokenizer()
 
 # =====================================================================
 # 【防爆核心】：最大模长裁剪 (Norm Clipping)
-# 作用：限制特征飞出安全区导致 NaN，但绝不改变短特征的长度(保留真实的双曲层级)
 # =====================================================================
 def clip_by_norm(x, max_norm=3.0):
     norm = torch.norm(x, dim=-1, keepdim=True)
@@ -159,6 +158,7 @@ class CustomCLIP(nn.Module):
         self.visual_scale = nn.Parameter(torch.tensor([1.0]))
         self.text_scale = nn.Parameter(torch.tensor([1.0]))
         
+        # 核心层级深度参数（初始化分别对应 粗、细、组合）
         self.d_coarse = nn.Parameter(torch.tensor([1.0]))
         self.d_fine = nn.Parameter(torch.tensor([2.0]))
         self.d_comp = nn.Parameter(torch.tensor([3.0]))
@@ -168,7 +168,6 @@ class CustomCLIP(nn.Module):
 
     # =====================================================================
     # 【严格对齐文献3】：Horosphere Projection (HP模块)
-    # 将双曲流形上的概念投影到平坦切空间，保留关系的同时获得组合性
     # =====================================================================
     def horosphere_projection(self, hyp_x, curv):
         return log_map0(hyp_x, curv=curv)
@@ -231,28 +230,44 @@ class CustomCLIP(nn.Module):
 
             if self.use_hyperbolic:
                 # ==========================================
-                # 终极修复区：严格对齐 HP 组合 + 半径截断防爆
+                # 终极修复区：深度注入 + HP 组合 + 概率对齐
                 # ==========================================
                 v_scale = torch.clamp(self.visual_scale.float(), min=0.01)
                 t_scale = torch.clamp(self.text_scale.float(), min=0.01)
 
+                # 利用 softplus 保证深度始终为正，且网络可以自发微调
+                d_c = F.softplus(self.d_coarse)
+                d_f = F.softplus(self.d_fine)
+                d_m = F.softplus(self.d_comp)
+
                 MAX_R = 3.5
 
-                # 1. 截断特征，保证不 NaN，同时保持相对长度比例
-                o_feat_clipped = clip_by_norm(o_feat_fp32 * v_scale, MAX_R)
-                v_feat_clipped = clip_by_norm(v_feat_fp32 * v_scale, MAX_R)
-                v_c_feat_clipped = clip_by_norm(v_c_feat_fp32 * v_scale, MAX_R)
+                # 1. 注入层级深度 (核心修复！这保证了 H2EM 损失不塌陷)
+                o_feat_scaled = o_feat_fp32 * v_scale * d_f
+                v_feat_scaled = v_feat_fp32 * v_scale * d_f
+                v_c_feat_scaled = v_c_feat_fp32 * v_scale * d_m
 
-                # 条件特征截断
-                o_cond_clipped = clip_by_norm(o_feat_c.float() * v_scale, MAX_R)
-                v_cond_clipped = clip_by_norm(v_feat_c.float() * v_scale, MAX_R)
+                o_cond_scaled = o_feat_c.float() * v_scale * d_f
+                v_cond_scaled = v_feat_c.float() * v_scale * d_f
 
-                t_v_clipped = clip_by_norm(verb_text_fp32 * t_scale, MAX_R)
-                t_o_clipped = clip_by_norm(obj_text_fp32 * t_scale, MAX_R)
-                coarse_v_clipped = clip_by_norm(coarse_verb_features.float() * t_scale, MAX_R)
-                coarse_o_clipped = clip_by_norm(coarse_obj_features.float() * t_scale, MAX_R)
+                verb_text_scaled = verb_text_fp32 * t_scale * d_f
+                obj_text_scaled = obj_text_fp32 * t_scale * d_f
+                coarse_verb_scaled = coarse_verb_features.float() * t_scale * d_c
+                coarse_obj_scaled = coarse_obj_features.float() * t_scale * d_c
 
-                # 2. 【建立双曲概念空间】：所有特征统一映射到双曲流形
+                # 防爆截断 (保留了相对长短)
+                o_feat_clipped = clip_by_norm(o_feat_scaled, MAX_R)
+                v_feat_clipped = clip_by_norm(v_feat_scaled, MAX_R)
+                v_c_feat_clipped = clip_by_norm(v_c_feat_scaled, MAX_R)
+                o_cond_clipped = clip_by_norm(o_cond_scaled, MAX_R)
+                v_cond_clipped = clip_by_norm(v_cond_scaled, MAX_R)
+
+                t_v_clipped = clip_by_norm(verb_text_scaled, MAX_R)
+                t_o_clipped = clip_by_norm(obj_text_scaled, MAX_R)
+                coarse_v_clipped = clip_by_norm(coarse_verb_scaled, MAX_R)
+                coarse_o_clipped = clip_by_norm(coarse_obj_scaled, MAX_R)
+
+                # 2. 【建立双曲概念空间】：统一映射到双曲流形
                 o_hyp = exp_map0(o_feat_clipped, curv=c_fp32)
                 v_hyp = exp_map0(v_feat_clipped, curv=c_fp32)
                 v_c_hyp = exp_map0(v_c_feat_clipped, curv=c_fp32) 
@@ -262,29 +277,30 @@ class CustomCLIP(nn.Module):
                 coarse_v_hyp_all = exp_map0(coarse_v_clipped, curv=c_fp32)
                 coarse_o_hyp_all = exp_map0(coarse_o_clipped, curv=c_fp32)
 
-                # 条件特征也必须在双曲空间中取得合法"身份"
                 o_cond_hyp = exp_map0(o_cond_clipped, curv=c_fp32)
                 v_cond_hyp = exp_map0(v_cond_clipped, curv=c_fp32)
 
-                # 3. 【执行 HP 投影】：从双曲概念空间投影到平坦组合空间 (严格对齐第三篇文献)
+                # 3. 【执行 HP 投影】：投影到极限球面（平坦切空间）
                 v_cond_hp_flat = self.horosphere_projection(v_cond_hyp, curv=c_fp32)
                 o_cond_hp_flat = self.horosphere_projection(o_cond_hyp, curv=c_fp32)
                 t_v_hp_flat = self.horosphere_projection(t_v_hyp_all, curv=c_fp32)
                 t_o_hp_flat = self.horosphere_projection(t_o_hyp_all, curv=c_fp32)
 
-                # 4. 在平坦空间中进行原生 C2C 组合
+                # 4. C2C 原生条件融合
                 cond_v_flat_out, cond_o_flat_out = self.condition_module_hyperbolic(
                     v_cond_hp_flat, o_cond_hp_flat, t_v_hp_flat, t_o_hp_flat, n_o, b, feat_dim_c, n_v
                 )
 
-                # 5. 组合特征防爆截断，然后重新映射回双曲空间
-                cond_o_flat_out = clip_by_norm(cond_o_flat_out, MAX_R)
-                cond_v_flat_out = clip_by_norm(cond_v_flat_out, MAX_R)
+                # 5. 重塑最深组合层级(d_m)，并重返双曲
+                # (乘以 d_m / d_f 是因为融合后的特征模长继承了基元 d_f 的级别，需要拔高到组合级别)
+                depth_ratio = (d_m / d_f).clamp(min=1.0)
+                cond_o_flat_out = clip_by_norm(cond_o_flat_out * depth_ratio, MAX_R)
+                cond_v_flat_out = clip_by_norm(cond_v_flat_out * depth_ratio, MAX_R)
 
                 cond_o_hyp = exp_map0(cond_o_flat_out, curv=c_fp32) 
                 cond_v_hyp = exp_map0(cond_v_flat_out, curv=c_fp32) 
 
-                # --- 测地距离计算 (H2EM 对齐) ---
+                # --- 测地距离计算 ---
                 verb_dist = pairwise_dist(v_hyp, t_v_hyp_all, curv=c_fp32)
                 obj_dist = pairwise_dist(o_hyp, t_o_hyp_all, curv=c_fp32)
                 cond_o_dist = pairwise_dist(cond_o_hyp.view(-1, feat_dim_c), t_o_hyp_all, curv=c_fp32).view(b, n_v, n_o)
@@ -300,7 +316,7 @@ class CustomCLIP(nn.Module):
                 logits_dyn = cond_o_logits + verb_logits.unsqueeze(-1)  
                 logits_sta = cond_v_logits.transpose(1, 2) + obj_logits.unsqueeze(1) 
 
-                # C2C Vanilla 双流融合概率对齐 (对数空间求和)
+                # 严格对齐 C2C 概率加法法则
                 pred_com_logits = torch.logsumexp(torch.stack([logits_dyn, logits_sta], dim=0), dim=0)
 
                 if self.training:
@@ -311,7 +327,8 @@ class CustomCLIP(nn.Module):
                     batch_comp_text_features = self.c2c_text_c(batch_comp_text_features)
 
                     with torch.cuda.amp.autocast(enabled=False):
-                        t_c_feat_fp32 = clip_by_norm(batch_comp_text_features.float() * t_scale, MAX_R)
+                        # 工具人也赋予最深层级
+                        t_c_feat_fp32 = clip_by_norm(batch_comp_text_features.float() * t_scale * d_m, MAX_R)
                         t_c_hyp_batch = exp_map0(t_c_feat_fp32, curv=c_fp32)
 
                     t_v_hyp_batch = t_v_hyp_all[batch_verb]
@@ -331,7 +348,7 @@ class CustomCLIP(nn.Module):
                     return pred_com_logits[:, verb_idx, obj_idx]
 
             else:
-                # ------------------------- 原生欧式分支 (保持绝对纯净) -------------------------
+                # ------------------------- 原生欧式分支 -------------------------
                 cond_v_euc, cond_o_euc = self.condition_module_hyperbolic(
                     v_feat_c.float(), o_feat_c.float(), verb_text_fp32, obj_text_fp32, n_o, b, feat_dim_c, n_v
                 )
@@ -389,6 +406,6 @@ def build_model(train_dataset, cfg):
         elif 'video_encoder' in name:
             if 'temporal_embedding' in name or 'ln_post' in name or 'Adapter' in name or 'clip_proj' in name:
                 param.requires_grad = True
-        elif 'c2c' in name or name in ['visual_scale', 'text_scale', 'cls_temp','c']:
+        elif 'c2c' in name or name in ['visual_scale', 'text_scale', 'cls_temp', 'c', 'd_coarse', 'd_fine', 'd_comp']:
             param.requires_grad = True
     return model
